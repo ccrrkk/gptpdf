@@ -9,6 +9,7 @@ from shapely.validation import explain_validity
 import concurrent.futures
 import logging
 from openai import OpenAI
+from shapely.ops import unary_union
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -61,6 +62,122 @@ def _union_rects(rect1, rect2):
     """
     return sg.box(*(rect1.union(rect2).bounds))
 
+def detect_and_filter_isolated_lines(rect_list,
+                                     thickness_thresh=1.5,
+                                     aspect_ratio=8,
+                                     neighbor_distance=10,
+                                     neighbor_count_threshold=2):
+    """
+    @param rect_list: list of shapely.geometry (sg.box 或其它 BaseGeometry)
+    @param thickness_thresh: 认定为线的最大短边阈值, 用于判定是否为细线
+    @param aspect_ratio: 长宽比阈值(如 8 表示长度至少为短边的 8 倍)
+    @param neighbor_distance: 邻近搜索的扩展距离
+    @param neighbor_count_threshold: 周围至少多少其它线才保留这条线(>=)
+    @return filtered_rects: list of shapely.geometry,剔除了判定为孤立分隔线的元素
+    """
+    # 规范化输入：只保留 shapely geometry
+    geoms = [g for g in rect_list if isinstance(g, BaseGeometry)]
+    if not geoms:
+        return []
+
+    candidate_idxs = []  
+
+    # 找到所有可能的细长线候选
+    for idx, g in enumerate(geoms):
+        x0, y0, x1, y1 = g.bounds
+        w = abs(x1 - x0)
+        h = abs(y1 - y0)
+        min_dim = min(w, h)
+        max_dim = max(w, h)
+
+        is_thin = (min_dim <= thickness_thresh)
+        is_aspect = (max_dim / max(min_dim, 1e-9) >= aspect_ratio)
+
+        if is_thin and is_aspect:
+            candidate_idxs.append(idx)
+
+    # 若没有候选，直接返回原列表
+    if not candidate_idxs:
+        return geoms
+
+    # 预取 candidate bounds 做快速数值邻近检测
+    cand_boxes = [geoms[i].bounds for i in candidate_idxs]
+    to_remove = set()  # 记录要删除的索引
+
+    for ci, bbox in enumerate(cand_boxes):
+        i = candidate_idxs[ci]
+        x0, y0, x1, y1 = bbox
+        max_dim = max(abs(x1 - x0), abs(y1 - y0))
+        margin = neighbor_distance + max_dim * 0.05
+        sx0, sy0, sx1, sy1 = x0 - margin, y0 - margin, x1 + margin, y1 + margin
+
+        neighbor_count = 0
+        for cj, obox in enumerate(cand_boxes):
+            if ci == cj:
+                continue
+            ox0, oy0, ox1, oy1 = obox
+            # 快速 bbox overlap / proximity 判定
+            if not (ox1 < sx0 or ox0 > sx1 or oy1 < sy0 or oy0 > sy1):
+                neighbor_count += 1
+                if neighbor_count >= neighbor_count_threshold:
+                    break
+
+        # 若邻居数小于阈值，则判为孤立分隔线 -> 标记删除
+        if neighbor_count < neighbor_count_threshold:
+            to_remove.add(i)
+
+    # 构建过滤后列表（去掉被标记的孤立线）
+    filtered = [g for idx, g in enumerate(geoms) if idx not in to_remove]
+    return filtered
+
+def _fast_merge_rects(rect_list, distance = 20, buffer_resolution=8):
+    """
+    快速合并列表中的矩形 (rect_list: list of shapely geometries)
+    对于所有矩形,先将他们膨胀 distance/2, 然后计算并集, 最后对每个组件做数值收缩.
+    这样可以避免逐对检测距离和合并, 提升效率.
+
+    @ param rect_list: 矩形列表
+    @ param distance: 目标距离
+    @ param buffer_resolution: buffer 分辨率
+    @ return: 合并后的矩形列表
+    """
+    if not rect_list:
+        return []
+
+    # 统一输入为 shapely geometries
+    geoms = []
+    for r in rect_list:
+        if isinstance(r, BaseGeometry):
+            geoms.append(r)
+        elif isinstance(r, (tuple, list)) and len(r) == 4:
+            geoms.append(sg.box(*r))
+        else:
+            # 跳过未知类型
+            continue
+
+    buffered = [g.buffer(distance/2.0, resolution=buffer_resolution) for g in geoms]
+    merged = unary_union(buffered)
+
+    # 方案：将并集按组件转为 axis-aligned boxes，然后对每个 box 做数值收缩（更可控）
+    try_shrink = distance / 2.0 - 0.1  # 留点余量避免过度收缩
+    merged_list = []
+    if merged.is_empty:
+        return []
+
+    comps = list(merged.geoms) if hasattr(merged, "geoms") else [merged] 
+    for comp in comps:
+        # 先修复可能的无效几何（保留原逻辑）
+        if explain_validity(comp) != 'Valid Geometry':
+            try:
+                comp = comp.buffer(0)
+            except Exception:
+                continue
+        x0, y0, x1, y1 = comp.bounds
+        # 数值收缩
+        nx0, ny0, nx1, ny1 = x0 + try_shrink, y0 + try_shrink, x1 - try_shrink, y1 - try_shrink
+        merged_list.append(sg.box(nx0, ny0, nx1, ny1))
+
+    return merged_list
 
 def _merge_rects(rect_list, distance = 20, horizontal_distance = None):
     """
@@ -115,25 +232,33 @@ def _parse_rects(page):
     @param page: 页面
     @return: 矩形列表
     """
+    # time_start = time.time()
+    # print(f"Parsing page {page.number}...")
 
     # 提取画的内容
     drawings = page.get_drawings()
-
-    # 忽略掉长度小于30的水平直线
+    # 过滤短水平直线
     is_short_line = lambda x: abs(x['rect'][3] - x['rect'][1]) < 1 and abs(x['rect'][2] - x['rect'][0]) < 30
-    drawings = [drawing for drawing in drawings if not is_short_line(drawing)]
-
-    # 转换为shapely的矩形
-    rect_list = [sg.box(*drawing['rect']) for drawing in drawings]
+    drawings = [d for d in drawings if not is_short_line(d)]
+    # 转为 shapely boxes
+    drawing_boxes = [sg.box(*d['rect']) for d in drawings]
 
     # 提取图片区域
     images = page.get_image_info()
-    image_rects = [sg.box(*image['bbox']) for image in images]
+    image_rects = [sg.box(*img['bbox']) for img in images]
 
-    # 合并drawings和images
-    rect_list += image_rects
+    # 把 drawing_boxes 和 image_rects 合并成候选 rect 列表，并检测并剔除孤立线
+    initial_rects = drawing_boxes + image_rects
+    filtered_rects = detect_and_filter_isolated_lines(
+        initial_rects,
+        thickness_thresh=1.5,
+        aspect_ratio=8,
+        neighbor_distance=10,
+        neighbor_count_threshold=2
+    )
 
-    merged_rects = _merge_rects(rect_list, distance=10, horizontal_distance=100)
+    # 接着用 fast merge（buffer + unary_union）
+    merged_rects = _fast_merge_rects(filtered_rects, distance=10)
     merged_rects = [rect for rect in merged_rects if explain_validity(rect) == 'Valid Geometry']
 
     # 将大文本区域和小文本区域分开处理: 大文本相小合并，小文本靠近合并
@@ -144,13 +269,12 @@ def _parse_rects(page):
     _, merged_rects = _adsorb_rects_to_rects(small_text_area_rects, merged_rects, distance=5) # 靠近
 
     # 再次自身合并
-    merged_rects = _merge_rects(merged_rects, distance=10)
+    merged_rects = _fast_merge_rects(merged_rects, distance=10)
 
     # 过滤比较小的矩形
     merged_rects = [rect for rect in merged_rects if rect.bounds[2] - rect.bounds[0] > 20 and rect.bounds[3] - rect.bounds[1] > 20]
 
     return [rect.bounds for rect in merged_rects]
-
 
 def _parse_pdf_to_images(pdf_path, output_dir = './'):
     """
